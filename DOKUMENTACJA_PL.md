@@ -1,118 +1,118 @@
-# Dokumentacja techniczna — Pipeline danych NBP (Bronze / Silver / Gold)
+# Technical Documentation — NBP Data Pipeline (Bronze / Silver / Gold)
 
-Dokument opisuje implementację poszczególnych warstw pipeline'u: co robi każdy notebook, jakie decyzje projektowe za nim stoją i jakie ograniczenia są mi znane. Ogólny opis projektu i instrukcja uruchomienia znajdują się w [README.md](README.md).
+This document describes how each layer of the pipeline is implemented: what each notebook does, the design decisions behind it, and the limitations I am aware of. For a general project overview and setup instructions, see [README.en.md](README.en.md).
 
-## 1. Przegląd
+## 1. Overview
 
-Pipeline realizuje architekturę medalionową (Bronze → Silver → Gold) w Microsoft Fabric na PySpark i Delta Lake. Dane pochodzą z trzech endpointów publicznego API NBP:
+The pipeline implements a medallion architecture (Bronze → Silver → Gold) on Microsoft Fabric using PySpark and Delta Lake. Data comes from three endpoints of the public NBP (National Bank of Poland) API:
 
-- **Tabela A** — średnie kursy walut (`mid`)
-- **Tabela C** — kursy kupna/sprzedaży (`bid`/`ask`)
-- **Ceny złota** (`cenyzlota`)
+- **Table A** — average exchange rates (`mid`)
+- **Table C** — buy/sell rates (`bid`/`ask`)
+- **Gold prices** (`cenyzlota`)
 
-Wynikiem końcowym jest model gwiazdy podłączony do Power BI w trybie DirectLake (`nbp_raport.pbix`).
+The final output is a star schema connected to Power BI via DirectLake (`nbp_raport.pbix`).
 
-| Katalog | Zawartość |
+| Directory | Content |
 |---|---|
-| `code-bronze/` | `bronze_nbp_all_sources.py` — pobieranie danych z API NBP |
-| `code-silver/` | `silver_transform.py` — czyszczenie i standaryzacja danych |
-| `code-gold/` | `gold_star_schema.py` — budowa modelu gwiazdy |
-| `pipeline/`, `silver-layer-errors/` | Zrzuty ekranu z konfiguracji orkiestracji w Fabric i napotkanych błędów |
+| `code-bronze/` | `bronze_nbp_all_sources.py` — ingestion from the NBP API |
+| `code-silver/` | `silver_transform.py` — cleansing and standardization |
+| `code-gold/` | `gold_star_schema.py` — star schema build |
+| `pipeline/`, `silver-layer-errors/` | Screenshots of the Fabric orchestration setup and issues encountered |
 
 ---
 
-## 2. Warstwa Bronze — `bronze_nbp_all_sources.py`
+## 2. Bronze layer — `bronze_nbp_all_sources.py`
 
-Warstwa pobiera surowe dane z trzech endpointów NBP dla tego samego zakresu dat i zapisuje je do osobnych tabel Delta. Nie wykonuję tu żadnych transformacji biznesowych — jedynie spłaszczam JSON do struktury tabelarycznej.
+This layer fetches raw data from three NBP endpoints for the same date range and writes each to its own Delta table. No business transformation happens here — the JSON is only flattened into a tabular structure.
 
-### Budowa notebooka
+### How the notebook is built
 
-`SCHEMA_EXCHANGE_RATES` i `SCHEMA_GOLD` to jawnie zdefiniowane schematy Spark. Zdecydowałam się je zapisać wprost, ponieważ Spark nie potrafi wywnioskować typu kolumny, gdy wszystkie wartości w batchu są `None` — zgłasza wtedy `CANNOT_DETERMINE_TYPE`. Dotyczy to tabeli A, która nigdy nie zwraca `bid`/`ask`, oraz danych o złocie, które nie mają pól walutowych.
+`SCHEMA_EXCHANGE_RATES` and `SCHEMA_GOLD` are explicitly defined Spark schemas. I chose to declare them rather than rely on inference because Spark cannot determine a column's type when every value in a batch is `None`, raising `CANNOT_DETERMINE_TYPE`. This affects Table A, which never returns `bid`/`ask`, and the gold data, which has no currency fields at all.
 
-`SOURCES` to słownik konfiguracyjny — każde źródło opisuję szablonem URL, ścieżką zapisu Delta, nazwą parsera i typem tabeli. Dzięki temu dodanie kolejnego endpointu NBP nie wymaga zmian w logice, tylko wpisu w słowniku.
+`SOURCES` is a configuration dictionary — each source is described by a URL template, a Delta write path, a parser name and a table type. Adding another NBP endpoint therefore requires only a new dictionary entry, not changes to the logic.
 
-`generate_date_ranges()` dzieli zakres `DATE_FROM`–`DATE_TO` na fragmenty po maksymalnie 93 dni. To twardy limit API NBP na pojedyncze zapytanie.
+`generate_date_ranges()` splits the `DATE_FROM`–`DATE_TO` range into chunks of at most 93 days, which is the NBP API's hard limit per request.
 
-`fetch_nbp(url)` wykonuje request HTTP. Kod `404` traktuję jako „brak danych w tym zakresie" i zwracam pustą listę — API zwraca go dla okresów bez notowań. Błędy sieci i parsowania JSON przechwytuję i loguję, zwracając pustą listę zamiast przerywać całe zadanie.
+`fetch_nbp(url)` performs the HTTP request. I treat a `404` as "no data in this range" and return an empty list — the API returns it for periods without quotations. Network and JSON parsing errors are caught and logged, returning an empty list rather than aborting the entire job.
 
-`parse_exchange_rates()` i `parse_gold()` spłaszczają odpowiedzi API do list rekordów zgodnych ze schematem. Rozdzieliłam je, bo struktura odpowiedzi dla kursów i dla złota jest zupełnie inna.
+`parse_exchange_rates()` and `parse_gold()` flatten the API responses into schema-conformant records. They are separate functions because the response structure for rates and for gold is entirely different.
 
-Główna pętla iteruje po źródłach i zakresach dat, a po zebraniu wszystkich rekordów zapisuje je do Delta w trybie `overwrite`, dodając kolumny audytowe `_ingestion_timestamp`, `_source` i `_source_name`. Na końcu notebook odczytuje każdą tabelę Bronze i wypisuje liczbę wierszy — to prosta weryfikacja, że zapis się powiódł.
+The main loop iterates over sources and date ranges, then writes the accumulated records to Delta in `overwrite` mode, adding the audit columns `_ingestion_timestamp`, `_source` and `_source_name`. At the end the notebook re-reads each Bronze table and prints its row count as a simple confirmation that the write succeeded.
 
-### Znane ograniczenia
+### Known limitations
 
-Zapis w trybie `overwrite` oznacza, że każde uruchomienie nadpisuje całą historię danymi świeżo pobranymi z API. Przy tej skali danych to działa, ale nie ma mechanizmu ładowania przyrostowego ani CDC — przy dłuższej historii lub częstszym harmonogramie będzie to wymagało zmiany na `MERGE`.
+Writing in `overwrite` mode means every run replaces the full history with data freshly pulled from the API. This works at the current data volume, but there is no incremental load or CDC mechanism — a longer history or a more frequent schedule will require switching to `MERGE`.
 
-Błędy pojedynczych zapytań HTTP są przechwytywane po cichu. Chroni to zadanie przed przerwaniem przy chwilowej awarii API, ale nie ma alarmowania, jeśli jakiś zakres dat systematycznie zwraca puste dane. Do dodania: zliczanie nieudanych requestów i ostrzeżenie, gdy przekroczą próg.
-
----
-
-## 3. Warstwa Silver — `silver_transform.py`
-
-Warstwa czyści dane z Bronze: rzutuje typy, waliduje wartości, usuwa duplikaty, ujednolica schematy tabel A i C oraz je łączy.
-
-### Transformacje
-
-**`silver_exchange_rates_a`** (z `bronze_nbp_table_a`) — rzutowanie dat przez `to_date` i `mid_rate` na `double`, normalizacja tekstu (`currency_code` na wielkie litery, `currency_name` przez `initcap`), walidacja `mid_rate > 0`, deduplikacja po parze (`effective_date`, `currency_code`). Dodaję puste kolumny `bid_rate`/`ask_rate`, żeby schemat pasował do tabeli C przy późniejszym łączeniu.
-
-**`silver_exchange_rates_c`** (z `bronze_nbp_table_c`) — analogicznie, z dodatkową regułą biznesową: `bid_rate < ask_rate`. Spread musi być dodatni, więc wiersze łamiące ten warunek odrzucam jako błędne.
-
-**`silver_exchange_rates_merged`** — `FULL OUTER JOIN` tabel A i C po dacie i kodzie waluty, z wyliczeniem `spread = ask_rate - bid_rate`. Złączenie pełne zewnętrzne, bo obie tabele mogą teoretycznie mieć różne zestawy dat.
-
-Nazwa waluty i numer tabeli pobierane są w tym złączeniu wyłącznie z aliasu `a`. Jeśli wiersz istnieje tylko w tabeli C, `currency_name` będzie `NULL`. W praktyce NBP publikuje te same waluty w obu tabelach każdego dnia roboczego, więc na posiadanych danych sytuacja nie wystąpiła. Kierunek poprawki pozostaje otwarty — patrz sekcja 5.
-
-**`silver_gold_prices`** (z `bronze_nbp_gold`) — rzutowanie typów, walidacja `gold_price_pln > 0`, deduplikacja po dacie.
-
-Na końcu notebook wypisuje liczbę wierszy w każdej tabeli Silver.
-
-### Kod diagnostyczny
-
-Końcowe komórki notebooka (`In[5]`, `In[9]`, `In[13]`, `In[16]`) zawierają kod, którym diagnozowałam problem z widocznością tabel w Lakehouse — przebieg tego debugowania dokumentują zrzuty w `silver-layer-errors/`. Kod sprawdza aktualny katalog Sparka i listę zarejestrowanych tabel, a następnie rejestruje tabele Bronze jako tabele katalogowe przez `CREATE TABLE ... USING DELTA LOCATION` — najpierw ścieżką względną `Tables/...`, a po niepowodzeniu pełną ścieżką `abfss://`.
-
-Ścieżka bazowa nie jest wpisana na sztywno — wyznacza ją funkcja `resolve_base_path()`. Sprawdza najpierw zmienną środowiskową `NBP_LAKEHOUSE_TABLES_PATH` (przydatną przy uruchomieniu z pipeline'u), a gdy jej nie ma, odczytuje ścieżkę z `notebookutils.fs.ls("Tables")` i obcina nazwę tabeli. Dzięki temu notebook działa w dowolnym workspace bez edycji kodu, a identyfikatory środowiska nie trafiają do repozytorium.
+Individual HTTP request errors are swallowed silently. This protects the job from being killed by a transient API outage, but there is no alerting if a date range consistently returns empty data. To be added: counting failed requests and warning once they exceed a threshold.
 
 ---
 
-## 4. Warstwa Gold — `gold_star_schema.py`
+## 3. Silver layer — `silver_transform.py`
 
-Warstwa buduje model gwiazdy gotowy do podłączenia w Power BI przez DirectLake.
+This layer cleanses the Bronze data: casting types, validating values, removing duplicates, unifying the schemas of tables A and C, and merging them.
 
-### Tabele wynikowe
+### Transformations
 
-**`gold_dim_date`** — wymiar daty zbudowany z unii unikalnych dat z `silver_exchange_rates_merged` i `silver_gold_prices`. Zawiera `date_key` w formacie `yyyyMMdd` jako liczbę całkowitą, rok, kwartał, miesiąc wraz z nazwą, tydzień roku, dzień miesiąca i tygodnia, nazwę dnia oraz flagę weekendu.
+**`silver_exchange_rates_a`** (from `bronze_nbp_table_a`) — dates cast via `to_date` and `mid_rate` to `double`, text normalized (`currency_code` uppercased, `currency_name` through `initcap`), `mid_rate > 0` validation, deduplication on the (`effective_date`, `currency_code`) pair. I add empty `bid_rate`/`ask_rate` columns so the schema matches Table C for the later join.
 
-**`gold_dim_currency`** — wymiar waluty z kluczem surogatowym `currency_key` nadawanym przez `row_number()` po kodzie waluty, plus flaga `is_active`. Flaga jest zawsze `True`, bo nie implementowałam logiki dezaktywacji walut wycofanych z obrotu.
+**`silver_exchange_rates_c`** (from `bronze_nbp_table_c`) — the same pattern, with an additional business rule: `bid_rate < ask_rate`. The spread must be positive, so rows violating this are rejected as erroneous.
 
-Klucz nadawany jest od nowa przy każdym uruchomieniu. Przy obecnym `overwrite` całego modelu jest to spójne, bo tabele faktów przeliczam w tym samym przebiegu. Przy przejściu na ładowanie przyrostowe przestanie być — pojawienie się nowej waluty przesunie numerację i wcześniej zapisane fakty zaczną wskazywać na inny wiersz wymiaru. Rozważane warianty wyjścia z tego — patrz sekcja 5.
+**`silver_exchange_rates_merged`** — a `FULL OUTER JOIN` of tables A and C on date and currency code, computing `spread = ask_rate - bid_rate`. A full outer join because the two tables could in principle cover different sets of dates.
 
-**`gold_fact_exchange_rate`** — tabela faktów kursów walut połączona z wymiarami przez `currency_key` i `date_key`. Poza `mid_rate`, `bid_rate`, `ask_rate` i `spread` zawiera dzienną zmianę kursu (`daily_change`, `daily_change_pct`), liczoną funkcją okienkową `lag()` partycjonowaną po walucie.
+In this join the currency name and table number are taken from the `a` alias only. If a row exists solely in Table C, `currency_name` will be `NULL`. In practice NBP publishes the same currencies in both tables on every business day, and the case did not occur in the data I have. The direction of the fix remains open — see section 5.
 
-**`gold_fact_gold_price`** — analogiczna tabela dla cen złota, bez partycjonowania, ponieważ to pojedynczy szereg czasowy.
+**`silver_gold_prices`** (from `bronze_nbp_gold`) — type casting, `gold_price_pln > 0` validation, deduplication by date.
 
-Na końcu wykonuję `OPTIMIZE ... ZORDER BY` na obu tabelach faktów, po `date_key` i `currency_key`. Porządkuje to fizyczny układ plików Delta pod kątem filtrów, które Power BI wykonuje najczęściej.
+The notebook ends by printing row counts for each Silver table.
 
-### Uwagi implementacyjne
+### Diagnostic code
 
-`dim_currency` dziedziczy opisane wyżej zachowanie z `currency_name` — wymiar budowany jest z tabeli scalonej, więc ewentualne `NULL`-e przechodzą dalej.
+The final cells (`In[5]`, `In[9]`, `In[13]`, `In[16]`) contain the code I used to diagnose a table-visibility problem in the Lakehouse; the screenshots in `silver-layer-errors/` document that debugging session. The code inspects the current Spark catalog and the list of registered tables, then registers the Bronze tables as catalog tables via `CREATE TABLE ... USING DELTA LOCATION` — first with the relative `Tables/...` path and, after that failed, with the full `abfss://` path.
 
-`daily_change_pct` dzieli przez poprzednią wartość kursu lub ceny. Gdyby ta była `0` lub `NULL`, wynikiem jest `NULL` — Spark nie zgłasza wyjątku dzielenia przez zero, więc nie dodawałam osobnego zabezpieczenia.
-
-Pierwsze komórki notebooka (`In[1]`, `In[2]`) sprawdzają widoczność tabel Silver i rejestrują je w katalogu — ścieżkę wyznacza ta sama funkcja `resolve_base_path()` co w warstwie Silver.
+The base path is not hardcoded — it is resolved by the `resolve_base_path()` function. It first checks the `NBP_LAKEHOUSE_TABLES_PATH` environment variable (useful when running from a pipeline) and, failing that, reads the path from `notebookutils.fs.ls("Tables")` and strips the table name. The notebook therefore runs in any workspace without code edits, and no environment identifiers end up in the repository.
 
 ---
 
-## 5. Do zrobienia w kolejnych etapach
+## 4. Gold layer — `gold_star_schema.py`
 
-Projekt ma być przeniesiony na Databricks i przy tej okazji planuję następujące zmiany:
+This layer builds a star schema ready to be connected in Power BI through DirectLake.
 
-- zastąpienie pełnego przeładowania ładowaniem przyrostowym (`MERGE` zamiast `overwrite`),
-- **deduplikacja deterministyczna** — obecnie używam `dropDuplicates(["effective_date", "currency_code"])`, co przy dwóch wierszach o tym samym kluczu zostawia dowolny z nich. Do zastąpienia przez `row_number()` z jawnym sortowaniem po `_ingestion_timestamp DESC`, żeby zawsze wygrywał najnowszy zapis,
-- **retry z wykładniczym opóźnieniem** przy pobieraniu z API — obecnie pojedynczy błąd HTTP kończy się pustą listą dla całego zakresu dat, bez ponowienia próby; do tego zliczanie nieudanych requestów i ostrzeganie po przekroczeniu progu,
-- wyniesienie zakresu dat do konfiguracji zewnętrznej zamiast wartości w kodzie,
-- ujednolicenie zapisu w Bronze — obecnie zapisuję przez ścieżkę (`.save`), a w kolejnych warstwach odczytuję przez nazwę tabeli, co wymusza ręczną rejestrację `CREATE TABLE ... LOCATION`,
-- testy jednostkowe dla funkcji parsujących i plik `requirements.txt`.
+### Output tables
 
-Dwie kwestie zostawiam świadomie jako otwarte, bo obie wychodzą dopiero przy przejściu na ładowanie przyrostowe i w obu widzę argumenty po kilku stronach:
+**`gold_dim_date`** — a date dimension built from the union of distinct dates in `silver_exchange_rates_merged` and `silver_gold_prices`. It holds `date_key` as a `yyyyMMdd` integer, plus year, quarter, month and month name, week of year, day of month and of week, day name, and a weekend flag.
 
-- **klucz surogatowy w `dim_currency`** — trwały mapping przez `MERGE` (klucz nadawany tylko nowym kodom), klucz deterministyczny liczony z `sha2(currency_code, 256)` (bez stanu do utrzymywania, ale nieczytelny i szerszy niż liczba całkowita), albo rezygnacja z surogatu na rzecz `currency_code` jako klucza naturalnego (wymiar jest mały i bezhistoryczny),
-- **typ złączenia tabel A i C** — zostawić `FULL OUTER JOIN` i uzupełnić `coalesce()`, czy zejść do `INNER JOIN` i logować przypadki bez pary jako anomalię.
+**`gold_dim_currency`** — a currency dimension with the surrogate key `currency_key` assigned by `row_number()` ordered by currency code, plus an `is_active` flag. The flag is always `True` because I did not implement logic for deactivating currencies withdrawn from circulation.
+
+The key is reassigned from scratch on every run. Under the current full `overwrite` this stays consistent, because the fact tables are recomputed in the same pass. It will stop being consistent once loading becomes incremental — a new currency appearing mid-alphabet shifts the numbering, and previously written facts start pointing at a different dimension row. The options I am weighing are in section 5.
+
+**`gold_fact_exchange_rate`** — the exchange rate fact table, joined to the dimensions through `currency_key` and `date_key`. Besides `mid_rate`, `bid_rate`, `ask_rate` and `spread`, it holds the daily rate change (`daily_change`, `daily_change_pct`) computed with a `lag()` window function partitioned by currency.
+
+**`gold_fact_gold_price`** — the equivalent table for gold prices, without partitioning, since it is a single time series.
+
+Finally I run `OPTIMIZE ... ZORDER BY` on both fact tables, by `date_key` and `currency_key`. This arranges the physical Delta file layout around the filters Power BI issues most often.
+
+### Implementation notes
+
+`dim_currency` inherits the `currency_name` behaviour described above — the dimension is built from the merged table, so any `NULL`s propagate.
+
+`daily_change_pct` divides by the previous rate or price. Were that value `0` or `NULL`, the result is `NULL` — Spark does not raise a divide-by-zero exception, so I did not add a separate guard.
+
+The opening cells (`In[1]`, `In[2]`) check Silver table visibility and register them in the catalog — the path is resolved by the same `resolve_base_path()` function used in the Silver layer.
+
+---
+
+## 5. Planned for later stages
+
+The project is to be migrated to Databricks, and I plan the following changes along the way:
+
+- replacing the full reload with incremental loading (`MERGE` instead of `overwrite`),
+- **deterministic deduplication** — I currently use `dropDuplicates(["effective_date", "currency_code"])`, which keeps an arbitrary row when two share the same key. To be replaced with `row_number()` ordered explicitly by `_ingestion_timestamp DESC` so the most recent write always wins,
+- **retry with exponential backoff** on API calls — a single HTTP error currently yields an empty list for the whole date range with no second attempt; alongside that, counting failed requests and warning once they exceed a threshold,
+- moving the date range into external configuration rather than in-code values,
+- unifying the Bronze write path — currently I write by path (`.save`) but read by table name in later layers, which forces the manual `CREATE TABLE ... LOCATION` registration,
+- unit tests for the parsing functions and a `requirements.txt` file.
+
+Two questions I am deliberately leaving open, since both surface only once loading becomes incremental and both have arguments on several sides:
+
+- **the surrogate key in `dim_currency`** — a persistent mapping via `MERGE` (keys assigned only to new codes), a deterministic key derived from `sha2(currency_code, 256)` (no state to maintain, but unreadable and wider than an integer), or dropping the surrogate in favour of `currency_code` as a natural key (the dimension is small and carries no history),
+- **the join type between tables A and C** — keep the `FULL OUTER JOIN` and add `coalesce()`, or drop to an `INNER JOIN` and log unpaired rows as an anomaly.
