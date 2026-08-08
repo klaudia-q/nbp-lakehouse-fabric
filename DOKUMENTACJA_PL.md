@@ -59,7 +59,7 @@ Warstwa czyści dane z Bronze: rzutuje typy, waliduje wartości, usuwa duplikaty
 
 **`silver_exchange_rates_merged`** — `FULL OUTER JOIN` tabel A i C po dacie i kodzie waluty, z wyliczeniem `spread = ask_rate - bid_rate`. Złączenie pełne zewnętrzne, bo obie tabele mogą teoretycznie mieć różne zestawy dat.
 
-Nazwa waluty i numer tabeli pobierane są w tym złączeniu wyłącznie z aliasu `a`. Jeśli wiersz istnieje tylko w tabeli C, `currency_name` będzie `NULL`. W praktyce NBP publikuje te same waluty w obu tabelach każdego dnia roboczego, więc sytuacja nie występuje — do poprawy przez `coalesce(a.currency_name, c.currency_name)` i `coalesce(a.table_no, c.table_no)`.
+Nazwa waluty i numer tabeli pobierane są w tym złączeniu wyłącznie z aliasu `a`. Jeśli wiersz istnieje tylko w tabeli C, `currency_name` będzie `NULL`. W praktyce NBP publikuje te same waluty w obu tabelach każdego dnia roboczego, więc na posiadanych danych sytuacja nie wystąpiła. Kierunek poprawki pozostaje otwarty — patrz sekcja 5.
 
 **`silver_gold_prices`** (z `bronze_nbp_gold`) — rzutowanie typów, walidacja `gold_price_pln > 0`, deduplikacja po dacie.
 
@@ -82,6 +82,8 @@ Warstwa buduje model gwiazdy gotowy do podłączenia w Power BI przez DirectLake
 **`gold_dim_date`** — wymiar daty zbudowany z unii unikalnych dat z `silver_exchange_rates_merged` i `silver_gold_prices`. Zawiera `date_key` w formacie `yyyyMMdd` jako liczbę całkowitą, rok, kwartał, miesiąc wraz z nazwą, tydzień roku, dzień miesiąca i tygodnia, nazwę dnia oraz flagę weekendu.
 
 **`gold_dim_currency`** — wymiar waluty z kluczem surogatowym `currency_key` nadawanym przez `row_number()` po kodzie waluty, plus flaga `is_active`. Flaga jest zawsze `True`, bo nie implementowałam logiki dezaktywacji walut wycofanych z obrotu.
+
+Klucz nadawany jest od nowa przy każdym uruchomieniu. Przy obecnym `overwrite` całego modelu jest to spójne, bo tabele faktów przeliczam w tym samym przebiegu. Przy przejściu na ładowanie przyrostowe przestanie być — pojawienie się nowej waluty przesunie numerację i wcześniej zapisane fakty zaczną wskazywać na inny wiersz wymiaru. Rozwiązanie tego problemu opisuję w sekcji 5.
 
 **`gold_fact_exchange_rate`** — tabela faktów kursów walut połączona z wymiarami przez `currency_key` i `date_key`. Poza `mid_rate`, `bid_rate`, `ask_rate` i `spread` zawiera dzienną zmianę kursu (`daily_change`, `daily_change_pct`), liczoną funkcją okienkową `lag()` partycjonowaną po walucie.
 
@@ -106,6 +108,10 @@ Projekt ma być przeniesiony na Databricks i przy tej okazji planuję następuj�
 - zastąpienie pełnego przeładowania ładowaniem przyrostowym (`MERGE` zamiast `overwrite`),
 - wyniesienie zakresu dat do konfiguracji zewnętrznej zamiast wartości w kodzie,
 - ujednolicenie zapisu w Bronze — obecnie zapisuję przez ścieżkę (`.save`), a w kolejnych warstwach odczytuję przez nazwę tabeli, co wymusza ręczną rejestrację `CREATE TABLE ... LOCATION`,
-- `coalesce()` na `currency_name` i `table_no` przy budowie tabeli scalonej,
 - zliczanie nieudanych requestów HTTP i ostrzeganie przy przekroczeniu progu,
 - testy jednostkowe dla funkcji parsujących i plik `requirements.txt`.
+
+Dwie kwestie zostawiam świadomie jako otwarte, bo obie wychodzą dopiero przy przejściu na ładowanie przyrostowe i w obu widzę argumenty po dwóch stronach:
+
+- **klucz surogatowy w `dim_currency`** — trwały mapping przez `MERGE` czy rezygnacja z surogatu na rzecz `currency_code` jako klucza naturalnego (wymiar jest mały i bezhistoryczny),
+- **typ złączenia tabel A i C** — zostawić `FULL OUTER JOIN` i uzupełnić `coalesce()`, czy zejść do `INNER JOIN` i logować przypadki bez pary jako anomalię.
