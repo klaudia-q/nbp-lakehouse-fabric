@@ -59,7 +59,7 @@ This layer cleanses the Bronze data: casting types, validating values, removing 
 
 **`silver_exchange_rates_merged`** — a `FULL OUTER JOIN` of tables A and C on date and currency code, computing `spread = ask_rate - bid_rate`. A full outer join because the two tables could in principle cover different sets of dates.
 
-In this join the currency name and table number are taken from the `a` alias only. If a row exists solely in Table C, `currency_name` will be `NULL`. In practice NBP publishes the same currencies in both tables on every business day, so the case does not occur — to be fixed with `coalesce(a.currency_name, c.currency_name)` and `coalesce(a.table_no, c.table_no)`.
+In this join the currency name and table number are taken from the `a` alias only. If a row exists solely in Table C, `currency_name` will be `NULL`. In practice NBP publishes the same currencies in both tables on every business day, and the case did not occur in the data I have. The direction of the fix remains open — see section 5.
 
 **`silver_gold_prices`** (from `bronze_nbp_gold`) — type casting, `gold_price_pln > 0` validation, deduplication by date.
 
@@ -82,6 +82,8 @@ This layer builds a star schema ready to be connected in Power BI through Direct
 **`gold_dim_date`** — a date dimension built from the union of distinct dates in `silver_exchange_rates_merged` and `silver_gold_prices`. It holds `date_key` as a `yyyyMMdd` integer, plus year, quarter, month and month name, week of year, day of month and of week, day name, and a weekend flag.
 
 **`gold_dim_currency`** — a currency dimension with the surrogate key `currency_key` assigned by `row_number()` ordered by currency code, plus an `is_active` flag. The flag is always `True` because I did not implement logic for deactivating currencies withdrawn from circulation.
+
+The key is reassigned from scratch on every run. Under the current full `overwrite` this stays consistent, because the fact tables are recomputed in the same pass. It will stop being consistent once loading becomes incremental — a new currency appearing mid-alphabet shifts the numbering, and previously written facts start pointing at a different dimension row. See section 5 for how I plan to resolve this.
 
 **`gold_fact_exchange_rate`** — the exchange rate fact table, joined to the dimensions through `currency_key` and `date_key`. Besides `mid_rate`, `bid_rate`, `ask_rate` and `spread`, it holds the daily rate change (`daily_change`, `daily_change_pct`) computed with a `lag()` window function partitioned by currency.
 
@@ -106,6 +108,10 @@ The project is to be migrated to Databricks, and I plan the following changes al
 - replacing the full reload with incremental loading (`MERGE` instead of `overwrite`),
 - moving the date range into external configuration rather than in-code values,
 - unifying the Bronze write path — currently I write by path (`.save`) but read by table name in later layers, which forces the manual `CREATE TABLE ... LOCATION` registration,
-- applying `coalesce()` to `currency_name` and `table_no` when building the merged table,
 - counting failed HTTP requests and warning above a threshold,
 - unit tests for the parsing functions and a `requirements.txt` file.
+
+Two questions I am deliberately leaving open, since both surface only once loading becomes incremental and both have arguments on either side:
+
+- **the surrogate key in `dim_currency`** — a persistent mapping via `MERGE`, or dropping the surrogate in favour of `currency_code` as a natural key (the dimension is small and carries no history),
+- **the join type between tables A and C** — keep the `FULL OUTER JOIN` and add `coalesce()`, or drop to an `INNER JOIN` and log unpaired rows as an anomaly.
