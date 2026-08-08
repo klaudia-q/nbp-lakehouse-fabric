@@ -83,7 +83,7 @@ Warstwa buduje model gwiazdy gotowy do podłączenia w Power BI przez DirectLake
 
 **`gold_dim_currency`** — wymiar waluty z kluczem surogatowym `currency_key` nadawanym przez `row_number()` po kodzie waluty, plus flaga `is_active`. Flaga jest zawsze `True`, bo nie implementowałam logiki dezaktywacji walut wycofanych z obrotu.
 
-Klucz nadawany jest od nowa przy każdym uruchomieniu. Przy obecnym `overwrite` całego modelu jest to spójne, bo tabele faktów przeliczam w tym samym przebiegu. Przy przejściu na ładowanie przyrostowe przestanie być — pojawienie się nowej waluty przesunie numerację i wcześniej zapisane fakty zaczną wskazywać na inny wiersz wymiaru. Rozwiązanie tego problemu opisuję w sekcji 5.
+Klucz nadawany jest od nowa przy każdym uruchomieniu. Przy obecnym `overwrite` całego modelu jest to spójne, bo tabele faktów przeliczam w tym samym przebiegu. Przy przejściu na ładowanie przyrostowe przestanie być — pojawienie się nowej waluty przesunie numerację i wcześniej zapisane fakty zaczną wskazywać na inny wiersz wymiaru. Rozważane warianty wyjścia z tego — patrz sekcja 5.
 
 **`gold_fact_exchange_rate`** — tabela faktów kursów walut połączona z wymiarami przez `currency_key` i `date_key`. Poza `mid_rate`, `bid_rate`, `ask_rate` i `spread` zawiera dzienną zmianę kursu (`daily_change`, `daily_change_pct`), liczoną funkcją okienkową `lag()` partycjonowaną po walucie.
 
@@ -106,12 +106,13 @@ Pierwsze komórki notebooka (`In[1]`, `In[2]`) sprawdzają widoczność tabel Si
 Projekt ma być przeniesiony na Databricks i przy tej okazji planuję następujące zmiany:
 
 - zastąpienie pełnego przeładowania ładowaniem przyrostowym (`MERGE` zamiast `overwrite`),
+- **deduplikacja deterministyczna** — obecnie używam `dropDuplicates(["effective_date", "currency_code"])`, co przy dwóch wierszach o tym samym kluczu zostawia dowolny z nich. Do zastąpienia przez `row_number()` z jawnym sortowaniem po `_ingestion_timestamp DESC`, żeby zawsze wygrywał najnowszy zapis,
+- **retry z wykładniczym opóźnieniem** przy pobieraniu z API — obecnie pojedynczy błąd HTTP kończy się pustą listą dla całego zakresu dat, bez ponowienia próby; do tego zliczanie nieudanych requestów i ostrzeganie po przekroczeniu progu,
 - wyniesienie zakresu dat do konfiguracji zewnętrznej zamiast wartości w kodzie,
 - ujednolicenie zapisu w Bronze — obecnie zapisuję przez ścieżkę (`.save`), a w kolejnych warstwach odczytuję przez nazwę tabeli, co wymusza ręczną rejestrację `CREATE TABLE ... LOCATION`,
-- zliczanie nieudanych requestów HTTP i ostrzeganie przy przekroczeniu progu,
 - testy jednostkowe dla funkcji parsujących i plik `requirements.txt`.
 
-Dwie kwestie zostawiam świadomie jako otwarte, bo obie wychodzą dopiero przy przejściu na ładowanie przyrostowe i w obu widzę argumenty po dwóch stronach:
+Dwie kwestie zostawiam świadomie jako otwarte, bo obie wychodzą dopiero przy przejściu na ładowanie przyrostowe i w obu widzę argumenty po kilku stronach:
 
-- **klucz surogatowy w `dim_currency`** — trwały mapping przez `MERGE` czy rezygnacja z surogatu na rzecz `currency_code` jako klucza naturalnego (wymiar jest mały i bezhistoryczny),
+- **klucz surogatowy w `dim_currency`** — trwały mapping przez `MERGE` (klucz nadawany tylko nowym kodom), klucz deterministyczny liczony z `sha2(currency_code, 256)` (bez stanu do utrzymywania, ale nieczytelny i szerszy niż liczba całkowita), albo rezygnacja z surogatu na rzecz `currency_code` jako klucza naturalnego (wymiar jest mały i bezhistoryczny),
 - **typ złączenia tabel A i C** — zostawić `FULL OUTER JOIN` i uzupełnić `coalesce()`, czy zejść do `INNER JOIN` i logować przypadki bez pary jako anomalię.
