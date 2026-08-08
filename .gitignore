@@ -1,0 +1,22 @@
+# Dane wyeksportowane z tabel Delta - regenerowalne przez pipeline, nie trzymamy w git
+Parquety/
+
+# Dokumentacja migracji - material roboczy, poza zakresem repozytorium
+Migracja/
+
+# Eksporty notebookow do LaTeX - material pod prace dyplomowa, generowane z .py
+# Zawieraja tez logi sesji Spark i identyfikatory srodowiska Fabric
+*.tex
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Pliki tymczasowe/systemowe
+.DS_Store
+Thumbs.db
+*.tmp
+
+# Pliki tymczasowe Office (np. przy otwartym .docx/.pbix)
+~$*
